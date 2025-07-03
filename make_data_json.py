@@ -4,6 +4,7 @@ import io
 import docx
 import PyPDF2
 import openpyxl
+import requests
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -14,14 +15,18 @@ SERVICE_ACCOUNT_FILE = 'credentials.json'
 FOLDER_ID = '1SDBfV-2Zk7lriKUsgRSS6wWnyC2O7ZX0'
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly',
           'https://www.googleapis.com/auth/documents.readonly']
+CLOUDFLARE_API_TOKEN = os.getenv('CLOUDFLARE_API_TOKEN')  # должен быть установлен как переменная окружения
 
-# MIME-типы, которые обрабатываем
+CLOUDFLARE_ACCOUNT_ID = '215a19df1120e2c3a787071fa5a05dd9'
+EMBEDDING_MODEL = '@cf/baai/bge-base-ru-v1.5'
+EMBEDDING_ENDPOINT = f'https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{EMBEDDING_MODEL}'
+
 SUPPORTED_MIME_TYPES = [
-    'application/vnd.google-apps.document',          # Google Docs
-    'application/vnd.google-apps.spreadsheet',       # Google Sheets
+    'application/vnd.google-apps.document',
+    'application/vnd.google-apps.spreadsheet',
     'application/pdf',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # DOCX
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',        # XLSX
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 ]
 
 # --- Авторизация ---
@@ -50,7 +55,7 @@ def list_files(service, folder_id):
             break
     return files
 
-# --- Загрузка бинарных файлов (PDF, DOCX, XLSX) ---
+# --- Загрузка бинарных файлов ---
 def download_file(service, file_id):
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
@@ -61,7 +66,7 @@ def download_file(service, file_id):
     fh.seek(0)
     return fh
 
-# --- Извлечение текста из Google Docs напрямую ---
+# --- Google Docs ---
 def extract_text_from_google_doc(docs_service, file_id):
     doc = docs_service.documents().get(documentId=file_id).execute()
     text = []
@@ -74,17 +79,17 @@ def extract_text_from_google_doc(docs_service, file_id):
                     text.append(text_run.get('content', ''))
     return ''.join(text)
 
-# --- Извлечение текста из DOCX ---
+# --- DOCX ---
 def extract_text_from_docx(file_io):
     doc = docx.Document(file_io)
     return '\n'.join([p.text for p in doc.paragraphs])
 
-# --- Извлечение текста из PDF ---
+# --- PDF ---
 def extract_text_from_pdf(file_io):
     reader = PyPDF2.PdfReader(file_io)
     return '\n'.join([page.extract_text() or '' for page in reader.pages])
 
-# --- Извлечение текста из XLSX ---
+# --- XLSX ---
 def extract_text_from_xlsx(file_io):
     wb = openpyxl.load_workbook(file_io)
     text = []
@@ -92,6 +97,26 @@ def extract_text_from_xlsx(file_io):
         for row in sheet.iter_rows(values_only=True):
             text.append(' '.join([str(cell) if cell else '' for cell in row]))
     return '\n'.join(text)
+
+# --- Получение embedding через Cloudflare AI ---
+def get_embedding(text, api_token):
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "text": text
+    }
+    try:
+        response = requests.post(EMBEDDING_ENDPOINT, headers=headers, json=body)
+        if response.status_code == 200:
+            return response.json()['result']['data']
+        else:
+            print("⚠️ Ошибка от Cloudflare AI:", response.status_code, response.text)
+            return []
+    except Exception as e:
+        print("⚠️ Исключение при запросе embedding:", e)
+        return []
 
 # --- Главная функция ---
 def main():
@@ -103,7 +128,7 @@ def main():
         file_id = file['id']
         name = file['name']
         mime_type = file['mimeType']
-        print(f"Обрабатываем: {name} ({file_id})")
+        print(f"📄 Обрабатываем: {name} ({file_id})")
 
         content = "[Не поддерживается]"
 
@@ -112,7 +137,6 @@ def main():
                 content = extract_text_from_google_doc(docs_service, file_id)
 
             elif mime_type == 'application/vnd.google-apps.spreadsheet':
-                # Sheets: экспорт в XLSX
                 request = drive_service.files().export_media(fileId=file_id,
                     mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                 fh = io.BytesIO()
@@ -136,20 +160,28 @@ def main():
                 content = extract_text_from_xlsx(fh)
 
             else:
-                print(f"Формат не поддерживается: {mime_type}")
+                print(f"⛔️ Формат не поддерживается: {mime_type}")
 
         except Exception as e:
-            print(f"Ошибка при обработке {name}: {e}")
+            print(f"❌ Ошибка при обработке {name}: {e}")
+
+        # Генерируем embedding только если есть содержимое
+        if content != "[Не поддерживается]" and CLOUDFLARE_API_TOKEN:
+            embedding = get_embedding(content[:1000], CLOUDFLARE_API_TOKEN)
+        else:
+            embedding = []
 
         data.append({
             'id': file_id,
             'name': name,
             'mimeType': mime_type,
-            'content': content.strip()
+            'content': content.strip(),
+            'embedding': embedding
         })
 
     with open('data.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
     print("✅ Файл data.json успешно создан!")
 
 if __name__ == '__main__':
