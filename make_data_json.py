@@ -1,49 +1,136 @@
 import os
-import json
 import io
-import docx
-import PyPDF2
-import openpyxl
-import requests
-
+import json
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+import docx
+import openpyxl
+import PyPDF2
 
-# --- Настройки ---
-SERVICE_ACCOUNT_FILE = 'credentials.json'
-FOLDER_ID = '1SDBfV-2Zk7lriKUsgRSS6wWnyC2O7ZX0'
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly',
-          'https://www.googleapis.com/auth/documents.readonly']
-CLOUDFLARE_API_TOKEN = os.getenv('CLOUDFLARE_API_TOKEN')  # должен быть установлен как переменная окружения
+# --- НАСТРОЙКИ ---
+SERVICE_ACCOUNT_FILE = 'credentials.json'  # путь к твоему service account json
+FOLDER_ID = '1SDBfV-2Zk7lriKUsgRSS6wWnyC2O7ZX0'  # твоя папка на Google Диске
+SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/spreadsheets.readonly']
 
-CLOUDFLARE_ACCOUNT_ID = '215a19df1120e2c3a787071fa5a05dd9'
-EMBEDDING_MODEL = '@cf/baai/bge-base-ru-v1.5'
-EMBEDDING_ENDPOINT = f'https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{EMBEDDING_MODEL}'
+# --- АВТОРИЗАЦИЯ ---
+credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+drive_service = build('drive', 'v3', credentials=credentials)
+docs_service = build('docs', 'v1', credentials=credentials)
+sheets_service = build('sheets', 'v4', credentials=credentials)
 
-SUPPORTED_MIME_TYPES = [
-    'application/vnd.google-apps.document',
-    'application/vnd.google-apps.spreadsheet',
-    'application/pdf',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-]
+def chunk_text(text, chunk_size=500):
+    chunks = []
+    start = 0
+    length = len(text)
+    while start < length:
+        end = start + chunk_size
+        if end >= length:
+            chunks.append(text[start:].strip())
+            break
+        else:
+            space_pos = text.rfind(' ', start, end)
+            if space_pos == -1 or space_pos <= start:
+                space_pos = end
+            chunks.append(text[start:space_pos].strip())
+            start = space_pos
+    return chunks
 
-# --- Авторизация ---
-def get_services():
-    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    drive_service = build('drive', 'v3', credentials=creds)
-    docs_service = build('docs', 'v1', credentials=creds)
-    return drive_service, docs_service
+def extract_text_from_google_doc(doc_id):
+    try:
+        doc = docs_service.documents().get(documentId=doc_id).execute()
+        content = doc.get('body').get('content')
+        text = ''
+        for c in content:
+            paragraph = c.get('paragraph')
+            if paragraph:
+                elements = paragraph.get('elements')
+                for e in elements:
+                    text_run = e.get('textRun')
+                    if text_run:
+                        text += text_run.get('content')
+        return text.strip()
+    except Exception as e:
+        print(f"Ошибка при чтении Google Документа {doc_id}: {e}")
+        return ''
 
-# --- Получение списка файлов в папке ---
-def list_files(service, folder_id):
+def extract_text_from_google_sheet(sheet_id):
+    try:
+        # Получаем все листы
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        sheets = spreadsheet.get('sheets')
+        all_text = ''
+        for sheet in sheets:
+            title = sheet['properties']['title']
+            # Читаем весь диапазон листа
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=title
+            ).execute()
+            values = result.get('values', [])
+            # Преобразуем в текст, разделяем табуляцией
+            for row in values:
+                line = '\t'.join(row)
+                all_text += line + '\n'
+        return all_text.strip()
+    except Exception as e:
+        print(f"Ошибка при чтении Google Таблицы {sheet_id}: {e}")
+        return ''
+
+def extract_text_from_pdf(file_stream):
+    try:
+        reader = PyPDF2.PdfReader(file_stream)
+        text = ''
+        for page in reader.pages:
+            text += page.extract_text() + '\n'
+        return text.strip()
+    except Exception as e:
+        print(f"Ошибка при чтении PDF: {e}")
+        return ''
+
+def extract_text_from_docx(file_stream):
+    try:
+        doc = docx.Document(file_stream)
+        fullText = []
+        for para in doc.paragraphs:
+            fullText.append(para.text)
+        return '\n'.join(fullText).strip()
+    except Exception as e:
+        print(f"Ошибка при чтении DOCX: {e}")
+        return ''
+
+def extract_text_from_xlsx(file_stream):
+    try:
+        wb = openpyxl.load_workbook(file_stream, data_only=True)
+        all_text = ''
+        for sheet in wb.sheetnames:
+            ws = wb[sheet]
+            for row in ws.iter_rows(values_only=True):
+                row_text = [str(cell) if cell is not None else '' for cell in row]
+                all_text += '\t'.join(row_text) + '\n'
+        return all_text.strip()
+    except Exception as e:
+        print(f"Ошибка при чтении XLSX: {e}")
+        return ''
+
+def download_file(file_id, mime_type):
+    """Скачиваем файл с Google Диска в память"""
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+    return fh
+
+def get_files_from_folder(folder_id):
     query = f"'{folder_id}' in parents and trashed = false"
     files = []
     page_token = None
-
     while True:
-        response = service.files().list(
+        response = drive_service.files().list(
             q=query,
             spaces='drive',
             fields='nextPageToken, files(id, name, mimeType)',
@@ -55,134 +142,60 @@ def list_files(service, folder_id):
             break
     return files
 
-# --- Загрузка бинарных файлов ---
-def download_file(service, file_id):
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh
-
-# --- Google Docs ---
-def extract_text_from_google_doc(docs_service, file_id):
-    doc = docs_service.documents().get(documentId=file_id).execute()
-    text = []
-    for element in doc.get('body', {}).get('content', []):
-        paragraph = element.get('paragraph')
-        if paragraph:
-            for elem in paragraph.get('elements', []):
-                text_run = elem.get('textRun')
-                if text_run:
-                    text.append(text_run.get('content', ''))
-    return ''.join(text)
-
-# --- DOCX ---
-def extract_text_from_docx(file_io):
-    doc = docx.Document(file_io)
-    return '\n'.join([p.text for p in doc.paragraphs])
-
-# --- PDF ---
-def extract_text_from_pdf(file_io):
-    reader = PyPDF2.PdfReader(file_io)
-    return '\n'.join([page.extract_text() or '' for page in reader.pages])
-
-# --- XLSX ---
-def extract_text_from_xlsx(file_io):
-    wb = openpyxl.load_workbook(file_io)
-    text = []
-    for sheet in wb.worksheets:
-        for row in sheet.iter_rows(values_only=True):
-            text.append(' '.join([str(cell) if cell else '' for cell in row]))
-    return '\n'.join(text)
-
-# --- Получение embedding через Cloudflare AI ---
-def get_embedding(text, api_token):
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "text": text
-    }
-    try:
-        response = requests.post(EMBEDDING_ENDPOINT, headers=headers, json=body)
-        if response.status_code == 200:
-            return response.json()['result']['data']
-        else:
-            print("⚠️ Ошибка от Cloudflare AI:", response.status_code, response.text)
-            return []
-    except Exception as e:
-        print("⚠️ Исключение при запросе embedding:", e)
-        return []
-
-# --- Главная функция ---
 def main():
-    drive_service, docs_service = get_services()
-    files = list_files(drive_service, FOLDER_ID)
+    print("Получаем список файлов из папки...")
+    files = get_files_from_folder(FOLDER_ID)
     data = []
 
-    for file in files:
-        file_id = file['id']
-        name = file['name']
-        mime_type = file['mimeType']
-        print(f"📄 Обрабатываем: {name} ({file_id})")
+    for f in files:
+        file_id = f['id']
+        name = f['name']
+        mime = f['mimeType']
+        print(f"Обрабатываем файл: {name} ({mime})")
 
-        content = "[Не поддерживается]"
-
+        text = ''
         try:
-            if mime_type == 'application/vnd.google-apps.document':
-                content = extract_text_from_google_doc(docs_service, file_id)
-
-            elif mime_type == 'application/vnd.google-apps.spreadsheet':
-                request = drive_service.files().export_media(fileId=file_id,
-                    mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                fh.seek(0)
-                content = extract_text_from_xlsx(fh)
-
-            elif mime_type == 'application/pdf':
-                fh = download_file(drive_service, file_id)
-                content = extract_text_from_pdf(fh)
-
-            elif mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                fh = download_file(drive_service, file_id)
-                content = extract_text_from_docx(fh)
-
-            elif mime_type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
-                fh = download_file(drive_service, file_id)
-                content = extract_text_from_xlsx(fh)
-
+            if mime == 'application/vnd.google-apps.document':
+                text = extract_text_from_google_doc(file_id)
+            elif mime == 'application/vnd.google-apps.spreadsheet':
+                text = extract_text_from_google_sheet(file_id)
+            elif mime == 'application/vnd.google-apps.presentation':
+                # Можно добавить, если нужно, обработку презентаций (сейчас пропускаем)
+                print("Обработка Google Презентаций не реализована, пропускаем.")
+                continue
+            elif mime == 'application/pdf':
+                fh = download_file(file_id, mime)
+                text = extract_text_from_pdf(fh)
+            elif mime in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
+                fh = download_file(file_id, mime)
+                text = extract_text_from_docx(fh)
+            elif mime in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']:
+                fh = download_file(file_id, mime)
+                text = extract_text_from_xlsx(fh)
             else:
-                print(f"⛔️ Формат не поддерживается: {mime_type}")
-
+                print(f"Неизвестный тип файла {mime}, пропускаем.")
+                continue
         except Exception as e:
-            print(f"❌ Ошибка при обработке {name}: {e}")
+            print(f"Ошибка при обработке файла {name}: {e}")
+            continue
 
-        # Генерируем embedding только если есть содержимое
-        if content != "[Не поддерживается]" and CLOUDFLARE_API_TOKEN:
-            embedding = get_embedding(content[:1000], CLOUDFLARE_API_TOKEN)
-        else:
-            embedding = []
+        if not text.strip():
+            print(f"Пустой текст в файле {name}, пропускаем.")
+            continue
 
         data.append({
-            'id': file_id,
-            'name': name,
-            'mimeType': mime_type,
-            'content': content.strip(),
-            'embedding': embedding
+            "id": file_id,
+            "title": name,
+            "text_chunks": chunk_text(text, chunk_size=500),
+            "url": f"https://drive.google.com/file/d/{file_id}/view?usp=sharing",
+            "embedding": []
         })
 
-    with open('data.json', 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Сохраняем в JSON
+    with open('data.json', 'w', encoding='utf-8') as fjson:
+        json.dump(data, fjson, ensure_ascii=False, indent=2)
 
-    print("✅ Файл data.json успешно создан!")
+    print("Готово! Файл data.json создан.")
 
 if __name__ == '__main__':
     main()
